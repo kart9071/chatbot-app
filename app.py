@@ -1,6 +1,12 @@
-import os, json, logging, sys, re
+import os
+import json
+import logging
+import sys
+import re
+import asyncio
 from flask import Flask, request, jsonify, render_template
 import boto3
+from concurrent.futures import ThreadPoolExecutor
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -12,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Env Vars ---
-KB_ID_1 = "WDBONTXTWY"   # Currently not used, left here for future
+KB_ID_1 = "WDBONTXTWY"
 KB_ID_2 = "TKWQDABBSG"
 MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 AWS_REGION = "us-east-1"
@@ -25,13 +31,14 @@ comprehend = boto3.client("comprehendmedical", region_name=AWS_REGION)
 # --- Flask ---
 app = Flask(__name__)
 
-# --- Simple in-memory session storage ---
-# Stores entities + last_context for follow-up queries
+# --- In-memory session storage ---
 session_memory = {}
+
+# --- Max tokens for context ---
+MAX_CONTEXT_TOKENS = 15000  # adjust based on Claude model limit
 
 # ----------------- Entity Extraction -----------------
 def extract_entities(query: str):
-    """Use Comprehend Medical for entity extraction."""
     entities = {}
     try:
         resp = comprehend.detect_entities_v2(Text=query)
@@ -40,7 +47,6 @@ def extract_entities(query: str):
             txt = ent.get("Text", "")
             cat = ent.get("Category", "")
             etype = ent.get("Type", "")
-
             if cat == "PROTECTED_HEALTH_INFORMATION":
                 if etype == "NAME":
                     entities["patient_name"] = txt
@@ -51,46 +57,38 @@ def extract_entities(query: str):
                         entities["member_id"] = txt
     except Exception as e:
         logger.error(f"ComprehendMedical failed, fallback to regex: {e}")
-        # fallback regex
         m = re.search(r"\bmember\s+(\w+)", query, re.I)
         if m:
             entities["member_id"] = m.group(1)
         p = re.search(r"\bpatient\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})", query)
         if p:
             entities["patient_name"] = p.group(1)
-
     return entities
 
-
-def enrich_with_memory(session_id, entities):
-    """Keep memory of entities across session turns."""
+# ----------------- Memory Management -----------------
+def enrich_with_memory(session_id, entities, new_docs=None):
+    """Keep memory of entities and KB docs across session turns."""
     if session_id not in session_memory:
-        session_memory[session_id] = {}
+        session_memory[session_id] = {"entities": {}, "knowledge_cache": {}, "last_context": ""}
+
     memory = session_memory[session_id]
-    memory.update(entities)
-    for k, v in memory.items():
+
+    # Update entities
+    memory["entities"].update(entities)
+    for k, v in memory["entities"].items():
         if k not in entities:
             entities[k] = v
+
+    # Update knowledge cache
+    if new_docs:
+        for doc in new_docs:
+            doc_id = doc.get("metadata", {}).get("doc_id") or str(hash(doc['content']['text']))
+            memory["knowledge_cache"][doc_id] = doc['content']['text']
+
     return entities
 
 # ----------------- KB Retrieval -----------------
-def merge_results(a, b):
-    """Merge and sort results from two KBs, return combined text."""
-    all_docs = a + b
-    all_docs.sort(key=lambda r: r.get('score', 0), reverse=True)
-
-    merged_text = []
-    for r in all_docs:
-        meta = r.get('metadata', {})
-        text = r['content']['text']
-        logger.info(f"📄 Retrieved metadata: {meta}")
-        merged_text.append(f"[{meta}] {text}")
-
-    return "\n\n".join(merged_text)
-
-
 def retrieve_from_kb(kb_id: str, query: str, patient_ids=None):
-    """Retrieve documents from Bedrock Knowledge Base with optional filtering."""
     filter_obj = None
     if patient_ids:
         if len(patient_ids) == 1:
@@ -98,7 +96,7 @@ def retrieve_from_kb(kb_id: str, query: str, patient_ids=None):
         elif len(patient_ids) > 1:
             filter_obj = {"in": {"key": "patient_id", "value": patient_ids}}
 
-    config = {'vectorSearchConfiguration': {'numberOfResults': 10}}
+    config = {'vectorSearchConfiguration': {'numberOfResults': 7}}
     if filter_obj:
         config['vectorSearchConfiguration']['filter'] = filter_obj
 
@@ -112,33 +110,60 @@ def retrieve_from_kb(kb_id: str, query: str, patient_ids=None):
         logger.info(f"Retrieved doc from KB {kb_id} with metadata={d.get('metadata')}")
     return docs
 
-# ----------------- LLM Call -----------------
-def call_claude(query: str, context_text: str):
-    """Call Claude model with context + query."""
-    prompt = f"""Use the following documents to answer the question accurately.
+def merge_results(a, b):
+    all_docs = a + b
+    all_docs.sort(key=lambda r: r.get('score', 0), reverse=True)
+    merged_text = []
+    for r in all_docs:
+        meta = r.get('metadata', {})
+        text = r['content']['text']
+        merged_text.append(f"[{meta}] {text}")
+    return "\n\n".join(merged_text)
+
+def trim_context(text: str, max_tokens=MAX_CONTEXT_TOKENS):
+    tokens = text.split()
+    if len(tokens) > max_tokens:
+        return " ".join(tokens[-max_tokens:])
+    return text
+
+# ----------------- Async LLM Call -----------------
+async def call_claude_async(query: str, context_text: str):
+    loop = asyncio.get_event_loop()
+    prompt = f"""Act strictly as a U.S. healthcare clinical documentation improvement (CDI) analyst. 
+You must only answer questions related to U.S. healthcare, medical records, billing, RCM, or patient data. 
+Do NOT answer questions about sports, celebrities, politics, or any topic outside U.S. healthcare. 
+If the query is unrelated, respond with: "Sorry, I can only answer questions about U.S. healthcare."
+
+Use the following documents to provide your answer:
 
 Context:
 {context_text}
 
-Question: {query}
-Answer:"""
-    response = bedrock_client.invoke_model(
-        modelId=MODEL_ID,
-        body=json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": prompt}]}
-            ],
-            "max_tokens": 5000,
-            "temperature": 0.2
-        })
-    )
-    out = json.loads(response['body'].read().decode())
-    return out['content'][0]['text']
+Question:
+{query}
 
-# ----------------- API Route -----------------
+Answer:"""
+
+    def invoke():
+        response = bedrock_client.invoke_model(
+            modelId=MODEL_ID,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": prompt}]}
+                ],
+                "max_tokens": 12750,
+                "temperature": 0.2
+            })
+        )
+        out = json.loads(response['body'].read().decode())
+        return out['content'][0]['text']
+
+    return await loop.run_in_executor(None, invoke)
+
+# ----------------- Async API Route -----------------
 @app.route("/chat", methods=["POST"])
-def chat():
+async def chat():
     body = request.json
     query = body.get("query")
     session_id = body.get("session_id", "default")
@@ -147,52 +172,46 @@ def chat():
     if not query:
         return jsonify({"error": "Missing query"}), 400
 
-    # Extract new entities
+    # Extract entities
     new_entities = extract_entities(query)
-    all_entities = enrich_with_memory(session_id, new_entities)
 
-    # --- Include prior response context if available ---
-    previous_context = session_memory.get(session_id, {}).get("last_context", "")
-    if previous_context:
-        full_query = query + f"\n[previous context: {previous_context}]"
-    else:
-        entity_text = ", ".join(f"{k}: {v}" for k, v in all_entities.items())
-        full_query = query + (f"\n[context: {entity_text}]" if entity_text else "")
+    # Parallel KB retrieval
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        res1_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_1, query, patient_ids)
+        res2_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_2, query, patient_ids)
+        res1, res2 = await asyncio.gather(res1_future, res2_future)
 
-    # --- Retrieval ---
-    res1 = retrieve_from_kb(KB_ID_1, full_query, patient_ids)   # Optional KB
-    res2 = retrieve_from_kb(KB_ID_2, full_query, patient_ids)
+    # Update memory
+    all_entities = enrich_with_memory(session_id, new_entities, res1 + res2)
 
-    # Enrich entities from metadata
-    for doc in res1 + res2:
-        meta = doc.get("metadata", {})
-        if "patient_name" in meta:
-            all_entities["patient_name"] = meta["patient_name"]
-        if "patient_id" in meta:
-            if "patient_ids" not in all_entities:
-                all_entities["patient_ids"] = []
-            if meta["patient_id"] not in all_entities["patient_ids"]:
-                all_entities["patient_ids"].append(meta["patient_id"])
-
-    # Merge context
+    # Merge KB results
     context_text = merge_results(res1, res2)
-    source = "knowledge-base"
+
+    # Build full context (cached KB + current + previous) and trim if too long
+    memory = session_memory.get(session_id, {})
+    cached_docs = memory.get("knowledge_cache", {})
+    cached_text = "\n\n".join(cached_docs.values())
+    previous_context = memory.get("last_context", "")
+    full_context = "\n\n".join(filter(None, [cached_text, context_text, previous_context]))
+    full_context = trim_context(full_context)
 
     # Call Claude
-    answer = call_claude(full_query, context_text)
+    answer = await call_claude_async(query, full_context)
 
-    # --- Save response context for follow-up queries ---
-    session_memory[session_id]["last_context"] = answer
+    # Save trimmed response context
+    session_memory[session_id]["last_context"] = (full_context + "\n" + answer).strip()
 
     logger.info(
-        f"Response source={source}, query='{query[:40]}' entities={all_entities} patient_ids={patient_ids}"
+        f"Response source=knowledge-base, query='{query[:40]}', entities={all_entities}, patient_ids={patient_ids}"
     )
+
     return jsonify({
         "answer": answer,
-        "source": source,
+        "source": "knowledge-base",
         "entities": all_entities,
         "patient_ids": patient_ids,
-        "session_context": session_memory[session_id]  # helpful for debugging
+        "session_context": session_memory[session_id]
     })
 
 # ----------------- Frontend Route -----------------
