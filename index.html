@@ -81,6 +81,8 @@
   </div>
 
 <script>
+let sessionId = null;  // store session across messages in the tab
+
 async function sendMessage() {
     let input = document.getElementById('userInput');
     let idsInput = document.getElementById('patientIds');
@@ -92,7 +94,6 @@ async function sendMessage() {
     addMessage('user', text);
     input.value = '';
 
-    // Show loading bubble
     const loadingDiv = addMessage('bot', 'Typing', true);
 
     try {
@@ -101,12 +102,19 @@ async function sendMessage() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
                 query: text,
-                patient_ids: patientIds ? patientIds.split(',').map(id => id.trim()) : []
+                patient_ids: patientIds ? patientIds.split(',').map(id => id.trim()) : [],
+                session_id: sessionId   // ✅ include session_id if available
             })
         });
         const data = await resp.json();
         loadingDiv.remove();
-        typeOutMessage('bot', data.answer + " (source: " + data.source + ")");
+
+        // ✅ Capture and store session_id returned by backend
+        if (data.session_id) {
+            sessionId = data.session_id;
+        }
+
+        typeOutMessage('bot', data.answer + " (source docs: " + data.source_docs_count + ")");
     } catch (e) {
         loadingDiv.remove();
         addMessage('bot', '⚠️ Error getting response');
@@ -137,7 +145,7 @@ function typeOutMessage(role, text) {
             div.textContent += (i === 0 ? '' : ' ') + words[i];
             i++;
             chatbox.scrollTop = chatbox.scrollHeight;
-            setTimeout(showNext, 80); // delay between words
+            setTimeout(showNext, 80);
         }
     }
     showNext();
