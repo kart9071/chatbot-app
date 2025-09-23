@@ -7,6 +7,7 @@ import uuid
 from flask import Flask, request, jsonify, render_template
 import boto3
 from concurrent.futures import ThreadPoolExecutor
+import tiktoken 
 
 # --- Logging ---
 logging.basicConfig(
@@ -23,6 +24,8 @@ KB_ID_2 = "WDBONTXTWY"
 MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 AWS_REGION = "us-east-1"
 DYNAMO_TABLE = "RAGCacheTable"
+
+MAX_CONTEXT_TOKENS = 100
 
 # --- AWS Clients ---
 agent_client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
@@ -43,11 +46,31 @@ def save_session_context(session_id: str, context: list):
     """Save session context to DynamoDB."""
     session_table.put_item(Item={"cache_key": session_id, "context": context})
 
-def append_to_session(session_id: str, message: str):
-    """Append a new message to session context in DB."""
+# def append_to_session(session_id: str, message: str):
+#     """Append a new message to session context in DB."""
+#     context = get_session_context(session_id)
+#     context.append(message)
+#     save_session_context(session_id, context)
+
+def count_tokens(text: str) -> int:
+    # Approx fallback: 1 token ≈ 4 chars
+    return len(text) // 4  
+
+def append_to_session(session_id: str, message: str, min_keep: int = 5):
+    """Append new message with max token sliding window but always keep last N entries."""
     context = get_session_context(session_id)
     context.append(message)
+
+    # Flatten context into one string
+    combined = "\n".join(context)
+
+    # Trim until within token limit but keep last min_keep
+    while count_tokens(combined) > MAX_CONTEXT_TOKENS and len(context) > min_keep:
+        context.pop(0)   # remove oldest
+        combined = "\n".join(context)
+
     save_session_context(session_id, context)
+
 
 def delete_session(session_id: str):
     """Delete session context from DB."""
@@ -78,9 +101,52 @@ def merge_results(a, b):
     all_docs.sort(key=lambda r: r.get('score', 0), reverse=True)
     return "\n\n".join([r['content']['text'] for r in all_docs])
 
+def extract_chunk_metadata(doc):
+    """
+    Safely extract patient metadata from a KB chunk
+    """
+    # Default values
+    patient_name = "Unknown"
+    patient_id = "Unknown"
+    source = "Unknown"
+    score = doc.get("score")
+
+    # Inspect all available keys in content
+    content = doc.get("content", {})
+    # logger.debug(f"Full chunk content: {json.dumps(content, indent=2)}")
+
+
+    # 1. Check top-level metadata
+    meta = doc.get("metadata", {})
+    
+    # 2. Try metadataAttributes first
+    attrs = meta.get("metadataAttributes", {})
+    if attrs:
+        patient_name = attrs.get("patient_name", patient_name)
+        patient_id = attrs.get("patient_id", patient_id)
+
+    # 3. If metadataAttributes missing, try other keys (like x-amz-bedrock-kb-* keys)
+    if patient_name == "Unknown":
+        patient_name = meta.get("patient_name", patient_name)
+    if patient_id == "Unknown":
+        patient_id = meta.get("patient_id", patient_id)
+
+    # 4. Source
+    source = meta.get("x-amz-bedrock-kb-source-uri", source)
+
+    # Log final extraction
+    # logger.info(f"Extracted metadata: patient_name={patient_name}, patient_id={patient_id}, source={source}, score={score}")
+
+    return {
+        "patient_name": patient_name,
+        "patient_id": patient_id,
+        "source": source,
+        "score": score
+    }
+
 # ----------------- Preprocessing LLM -----------------
 async def preprocess_query(session_id: str, query: str):
-    """Use LLM to rewrite query using conversation context."""
+    """Let Claude decide whether to use previous context or not."""
     previous_context = "\n".join(get_session_context(session_id))
 
     prompt = f"""You are a query rewriting assistant.
@@ -92,13 +158,14 @@ User question:
 {query}
 
 Task:
-- Always rewrite the user’s question into a fully explicit version.
-- Replace vague references like "this patient", "these patients", "who is severe" etc.
-  with the exact patient names or IDs from the conversation history.
-- If multiple patients are in context, expand them explicitly.
-- If no patients are in history, leave the question unchanged.
+1. Decide if the user’s question depends on previous conversation history.
+   - If it uses vague references like "this patient", "these patients", "the last one", "he/she", 
+     then you MUST rewrite the question by expanding them with the exact patient names or IDs 
+     from the conversation history.
+   - If the question is complete on its own (standalone), IGNORE the conversation history 
+     and just return the user’s question unchanged.
 
-Return ONLY the rewritten question. No explanation, no commentary."""
+2. Return ONLY the rewritten question. Do not explain your reasoning. Do not add extra text."""
 
     def invoke():
         response = bedrock_client.invoke_model(
@@ -118,17 +185,19 @@ Return ONLY the rewritten question. No explanation, no commentary."""
     loop = asyncio.get_event_loop()
     rewritten = await loop.run_in_executor(None, invoke)
 
-    # Save user query + rewritten
+    # Save both original + rewritten in session
     append_to_session(session_id, f"User: {query}")
     append_to_session(session_id, f"Rewritten: {rewritten}")
 
     return rewritten
 
-# ----------------- Claude Call -----------------
-async def call_claude_async(query: str, context_text: str):
+
+async def call_claude_with_precise_answers(query: str, context_text: str):
     loop = asyncio.get_event_loop()
     prompt = f"""
-Use the following documents to answer:
+You are an expert medical assistant.
+
+You will be given patient documents (each includes name, ID, source, and content).
 
 Context:
 {context_text}
@@ -136,16 +205,27 @@ Context:
 Question:
 {query}
 
-Answer:"""
+Task:
+1. First, provide a clear, natural language answer to the question.
+2. Then, separately provide a JSON list of sources you relied on.  
+   - Each entry must have: patient_name, patient_id, source.
+   - Return ONLY the list in valid JSON (no commentary).
+
+Format exactly like this:
+
+Answer:
+<your natural language answer here>
+
+Used_Sources:
+[{{"patient_name": "...", "patient_id": "...", "source": "..."}}]
+"""
 
     def invoke():
         response = bedrock_client.invoke_model(
             modelId=MODEL_ID,
             body=json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
-                "messages": [
-                    {"role": "user", "content": [{"type": "text", "text": prompt}]}
-                ],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                 "max_tokens": 12500,
                 "temperature": 0.2
             })
@@ -153,10 +233,36 @@ Answer:"""
         out = json.loads(response['body'].read().decode())
         return out['content'][0]['text']
 
-    return await loop.run_in_executor(None, invoke)
+    result_text = await loop.run_in_executor(None, invoke)
 
-# ----------------- Routes -----------------
-# ----------------- Routes -----------------
+    # --- Split answer and sources ---
+    answer_text = ""
+    used_sources = []
+
+    if "Used_Sources:" in result_text:
+        parts = result_text.split("Used_Sources:")
+        answer_text = parts[0].replace("Answer:", "").strip()
+        json_part = parts[1].strip()
+
+        # Clean up if wrapped in code fences
+        if json_part.startswith("```"):
+            json_part = json_part.strip("` \n")
+            if json_part.lower().startswith("json"):
+                json_part = json_part[4:].strip()
+
+        try:
+            used_sources = json.loads(json_part)
+        except Exception as e:
+            logger.error(f"Failed parsing used_sources JSON: {e}\nRaw: {json_part}")
+            used_sources = []
+    else:
+        # If Claude didn’t follow format, fallback
+        answer_text = result_text.strip()
+
+    return answer_text, used_sources
+
+
+
 @app.route("/chat", methods=["POST"])
 async def chat():
     body = request.json
@@ -181,60 +287,40 @@ async def chat():
         r2_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_2, rewritten_query)
         docs1, docs2 = await asyncio.gather(r1_future, r2_future)
 
-    # Log metadata and content for KB1
-    logger.info(f"Session {session_id} | KB1 ({KB_ID_1}) retrieved {len(docs1)} documents")
-    for i, doc in enumerate(docs1, 1):
-        content = doc['content'].get('text', '')
-        metadata = {k: v for k, v in doc['content'].items() if k != 'text'}
-        logger.info(f"KB1 Doc {i} | Metadata: {metadata} | Content: {content[:500]}")  # first 500 chars
+    # Step 3 - Build context text
+    context_chunks = []
+    for doc in docs1 + docs2:
+        c = doc['content'].get('text', '')
+        m = extract_chunk_metadata(doc)
+        chunk_text = f"""
+Patient Name: {m['patient_name']}
+Patient ID: {m['patient_id']}
+Source: {m['source']}
 
-    # Log metadata and content for KB2
-    logger.info(f"Session {session_id} | KB2 ({KB_ID_2}) retrieved {len(docs2)} documents")
-    for i, doc in enumerate(docs2, 1):
-        content = doc['content'].get('text', '')
-        metadata = {k: v for k, v in doc['content'].items() if k != 'text'}
-        logger.info(f"KB2 Doc {i} | Metadata: {metadata} | Content: {content[:500]}")  # first 500 chars
+Content:
+{c}
+"""
+        context_chunks.append(chunk_text)
+    context_text = "\n\n".join(context_chunks)
 
-    # Step 3 - Merge KB results
-    context_text = merge_results(docs1, docs2)
+    # Step 4 - Call Claude
+    answer_text, used_sources = await call_claude_with_precise_answers(rewritten_query, context_text)
 
-    # Step 4 - Claude answer
-    answer = await call_claude_async(rewritten_query, context_text)
+    logger.info(used_sources)
 
-    # Step 5 - Save answer
-    append_to_session(session_id, f"Answer: {answer}")
+    # Step 5 - Save in session
+    append_to_session(session_id, f"Answer: {answer_text}")
 
+    # Step 6 - Return response
     return jsonify({
-        "answer": answer,
-        "rewritten_query": rewritten_query,
+        "answer": answer_text,                # Natural language
+        "rewritten_query": rewritten_query,   # Debug info
         "source_docs_count": len(docs1) + len(docs2),
+        "used_sources": used_sources,         # Extracted from Claude itself
         "session_id": session_id
     })
 
-@app.route("/patients", methods=["POST"])
-def patients():
-    """
-    Add patients to session context.
-    Body example:
-    {
-        "session_id": "123",
-        "patients": [
-            {"id": 2, "name": "Timothy M Grafinger"},
-            {"id": 3, "name": "Willie Goins"}
-        ]
-    }
-    """
-    body = request.json
-    session_id = body.get("session_id")
-    patients = body.get("patients", [])
 
-    if not session_id:
-        return jsonify({"error": "Missing session_id"}), 400
-    if not patients:
-        return jsonify({"error": "No patients provided"}), 400
-
-    store_patients_in_context(session_id, patients)
-    return jsonify({"message": "Patients stored", "patients": patients})
 
 @app.route("/end_session", methods=["POST"])
 def end_session():

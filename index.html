@@ -114,7 +114,7 @@ async function sendMessage() {
             sessionId = data.session_id;
         }
 
-        typeOutMessage('bot', data.answer + " (source docs: " + data.source_docs_count + ")");
+        typeOutMessage('bot', data.answer);
     } catch (e) {
         loadingDiv.remove();
         addMessage('bot', '⚠️ Error getting response');
