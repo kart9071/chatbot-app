@@ -19,13 +19,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Env ---
-KB_ID_1 = "TKWQDABBSG"
-KB_ID_2 = "WDBONTXTWY"
+# KB_ID_2 = "WDBONTXTWY"
+KB_ID_1 = "I5E7NJH4NE"   # disabled
 MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 AWS_REGION = "us-east-1"
 DYNAMO_TABLE = "RAGCacheTable"
 
-MAX_CONTEXT_TOKENS = 100
+MAX_CONTEXT_TOKENS = 1000
 
 # --- AWS Clients ---
 agent_client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
@@ -45,12 +45,6 @@ def get_session_context(session_id: str):
 def save_session_context(session_id: str, context: list):
     """Save session context to DynamoDB."""
     session_table.put_item(Item={"cache_key": session_id, "context": context})
-
-# def append_to_session(session_id: str, message: str):
-#     """Append a new message to session context in DB."""
-#     context = get_session_context(session_id)
-#     context.append(message)
-#     save_session_context(session_id, context)
 
 def count_tokens(text: str) -> int:
     # Approx fallback: 1 token ≈ 4 chars
@@ -87,14 +81,19 @@ def store_patients_in_context(session_id: str, patients: list):
     append_to_session(session_id, line)
 
 # ----------------- KB Retrieval -----------------
-def retrieve_from_kb(kb_id: str, query: str):
-    config = {'vectorSearchConfiguration': {'numberOfResults': 7}}
+def retrieve_from_kb(kb_id: str, query: str, search_type: str = "HYBRID"):
+    config = {
+        "vectorSearchConfiguration": {
+            "numberOfResults": 50,
+            "overrideSearchType": search_type.upper()  # ✅ correct field name
+        }
+    }
     res = agent_client.retrieve(
         knowledgeBaseId=kb_id,
-        retrievalQuery={'text': query},
+        retrievalQuery={"text": query},
         retrievalConfiguration=config
     )
-    return res.get('retrievalResults', [])
+    return res.get("retrievalResults", [])
 
 def merge_results(a, b):
     all_docs = a + b
@@ -105,37 +104,28 @@ def extract_chunk_metadata(doc):
     """
     Safely extract patient metadata from a KB chunk
     """
-    # Default values
     patient_name = "Unknown"
     patient_id = "Unknown"
     source = "Unknown"
     score = doc.get("score")
 
-    # Inspect all available keys in content
     content = doc.get("content", {})
-    # logger.debug(f"Full chunk content: {json.dumps(content, indent=2)}")
-
-
-    # 1. Check top-level metadata
     meta = doc.get("metadata", {})
     
-    # 2. Try metadataAttributes first
+    # 1. Try metadataAttributes
     attrs = meta.get("metadataAttributes", {})
     if attrs:
         patient_name = attrs.get("patient_name", patient_name)
         patient_id = attrs.get("patient_id", patient_id)
 
-    # 3. If metadataAttributes missing, try other keys (like x-amz-bedrock-kb-* keys)
+    # 2. Fallback keys
     if patient_name == "Unknown":
         patient_name = meta.get("patient_name", patient_name)
     if patient_id == "Unknown":
         patient_id = meta.get("patient_id", patient_id)
 
-    # 4. Source
+    # 3. Source
     source = meta.get("x-amz-bedrock-kb-source-uri", source)
-
-    # Log final extraction
-    # logger.info(f"Extracted metadata: patient_name={patient_name}, patient_id={patient_id}, source={source}, score={score}")
 
     return {
         "patient_name": patient_name,
@@ -185,7 +175,6 @@ Task:
     loop = asyncio.get_event_loop()
     rewritten = await loop.run_in_executor(None, invoke)
 
-    # Save both original + rewritten in session
     append_to_session(session_id, f"User: {query}")
     append_to_session(session_id, f"Rewritten: {rewritten}")
 
@@ -195,7 +184,7 @@ Task:
 async def call_claude_with_precise_answers(query: str, context_text: str):
     loop = asyncio.get_event_loop()
     prompt = f"""
-You are an expert medical assistant.
+You are an expert medical assistant. Don't answer questions other than healthcare.
 
 You will be given patient documents (each includes name, ID, source, and content).
 
@@ -226,7 +215,7 @@ Used_Sources:
             body=json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
                 "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-                "max_tokens": 12500,
+                "max_tokens": 50000,
                 "temperature": 0.2
             })
         )
@@ -244,7 +233,6 @@ Used_Sources:
         answer_text = parts[0].replace("Answer:", "").strip()
         json_part = parts[1].strip()
 
-        # Clean up if wrapped in code fences
         if json_part.startswith("```"):
             json_part = json_part.strip("` \n")
             if json_part.lower().startswith("json"):
@@ -256,7 +244,6 @@ Used_Sources:
             logger.error(f"Failed parsing used_sources JSON: {e}\nRaw: {json_part}")
             used_sources = []
     else:
-        # If Claude didn’t follow format, fallback
         answer_text = result_text.strip()
 
     return answer_text, used_sources
@@ -280,12 +267,14 @@ async def chat():
     rewritten_query = await preprocess_query(session_id, query)
     logger.info(f"Session {session_id} | Original: {query} | Rewritten: {rewritten_query}")
 
-    # Step 2 - KB retrieval
+    # Step 2 - KB retrieval (only KB1)
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor() as executor:
         r1_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_1, rewritten_query)
-        r2_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_2, rewritten_query)
-        docs1, docs2 = await asyncio.gather(r1_future, r2_future)
+        # r2_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_2, rewritten_query)
+        # docs1, docs2 = await asyncio.gather(r1_future, r2_future)
+        docs1 = await r1_future
+        docs2 = []   # disabled
 
     # Step 3 - Build context text
     context_chunks = []
@@ -313,13 +302,12 @@ Content:
 
     # Step 6 - Return response
     return jsonify({
-        "answer": answer_text,                # Natural language
-        "rewritten_query": rewritten_query,   # Debug info
-        "source_docs_count": len(docs1) + len(docs2),
-        "used_sources": used_sources,         # Extracted from Claude itself
+        "answer": answer_text,
+        "rewritten_query": rewritten_query,
+        "source_docs_count": len(docs1),   # only KB1 now
+        "used_sources": used_sources,
         "session_id": session_id
     })
-
 
 
 @app.route("/end_session", methods=["POST"])

@@ -1,14 +1,82 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>RAG Chatbot</title>
+  <title>Vidura - RAG Chatbot</title>
   <style>
+    :root {
+      --bg-light: #f5f5f5;
+      --text-light: #000;
+      --user-msg-light: #007bff;
+      --bot-msg-light: #e4e6eb;
+
+      --bg-dark: #18191a;
+      --text-dark: #e4e6eb;
+      --user-msg-dark: #4a90e2;
+      --bot-msg-dark: #3a3b3c;
+    }
+
     body {
       font-family: Arial, sans-serif;
-      background: #f5f5f5;
-      margin: 0; padding: 0;
-      display: flex; flex-direction: column; height: 100vh;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      transition: background 0.3s, color 0.3s;
     }
+
+    body.light {
+      background: var(--bg-light);
+      color: var(--text-light);
+    }
+
+    body.dark {
+      background: var(--bg-dark);
+      color: var(--text-dark);
+    }
+
+    /* ===== Header ===== */
+    #header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid #ddd;
+      background: #007bff;
+      color: white;
+    }
+
+    #header h1 {
+      font-size: 18px;
+      margin: 0;
+    }
+
+    #themeToggle {
+      padding: 6px 12px;
+      border-radius: 20px;
+      border: none;
+      background: white;
+      color: #007bff;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.3s;
+    }
+
+    #themeToggle:hover {
+      background: #eee;
+    }
+
+    body.dark #header {
+      background: #242526;
+      border-bottom: 1px solid #3a3b3c;
+      color: var(--text-dark);
+    }
+    body.dark #themeToggle {
+      background: #3a3b3c;
+      color: var(--text-dark);
+    }
+
+    /* ===== Chatbox ===== */
     #chatbox {
       flex: 1;
       overflow-y: auto;
@@ -17,6 +85,7 @@
       flex-direction: column;
       gap: 14px;
     }
+
     .message {
       max-width: 75%;
       padding: 12px 16px;
@@ -24,43 +93,81 @@
       line-height: 1.5;
       word-wrap: break-word;
       white-space: pre-wrap;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      transition: background 0.3s, color 0.3s;
+      font-size: 15px;
     }
-    .user {
+
+    body.light .user {
       align-self: flex-end;
-      background: #007bff;
+      background: var(--user-msg-light);
       color: white;
       border-bottom-right-radius: 4px;
     }
-    .bot {
+
+    body.light .bot {
       align-self: flex-start;
-      background: #e4e6eb;
-      color: #000;
+      background: var(--bot-msg-light);
+      color: var(--text-light);
       border-bottom-left-radius: 4px;
     }
+
+    body.dark .user {
+      align-self: flex-end;
+      background: var(--user-msg-dark);
+      color: white;
+      border-bottom-right-radius: 4px;
+    }
+
+    body.dark .bot {
+      align-self: flex-start;
+      background: var(--bot-msg-dark);
+      color: var(--text-dark);
+      border-bottom-left-radius: 4px;
+    }
+
     .loading-dots::after {
       content: '';
       animation: dots 1.5s steps(4, end) infinite;
     }
+
     @keyframes dots {
       0%, 20% { content: ''; }
       40% { content: '.'; }
       60% { content: '..'; }
       80%, 100% { content: '...'; }
     }
+
+    /* ===== Input Bar ===== */
     #inputBar {
       display: flex;
       padding: 10px;
       background: white;
       border-top: 1px solid #ddd;
       gap: 10px;
+      transition: background 0.3s, border 0.3s;
     }
-    #userInput, #patientIds {
+
+    body.dark #inputBar {
+      background: #242526;
+      border-top: 1px solid #3a3b3c;
+    }
+
+    #userInput {
       flex: 1;
-      padding: 10px;
+      padding: 12px;
       border: 1px solid #ccc;
       border-radius: 20px;
       outline: none;
+      transition: background 0.3s, color 0.3s, border 0.3s;
     }
+
+    body.dark #userInput {
+      background: #3a3b3c;
+      color: var(--text-dark);
+      border: 1px solid #555;
+    }
+
     #sendBtn {
       padding: 0 20px;
       border: none;
@@ -68,31 +175,71 @@
       background: #007bff;
       color: white;
       cursor: pointer;
+      transition: background 0.3s;
+    }
+
+    #sendBtn:hover:enabled {
+      background: #0056b3;
+    }
+
+    #sendBtn:disabled {
+      background: #999;
+      cursor: not-allowed;
+    }
+
+    /* ===== Mobile Support ===== */
+    @media (max-width: 600px) {
+      #header h1 {
+        font-size: 16px;
+      }
+      #chatbox {
+        padding: 12px;
+      }
+      .message {
+        font-size: 14px;
+        padding: 10px 14px;
+      }
+      #userInput {
+        font-size: 14px;
+      }
+      #sendBtn {
+        padding: 0 16px;
+        font-size: 14px;
+      }
     }
   </style>
 </head>
-<body>
+<body class="light">
+  <div id="header">
+    <h1>🤖 Vidura</h1>
+    <button id="themeToggle">🌙 Dark Mode</button>
+  </div>
+
   <div id="chatbox"></div>
 
   <div id="inputBar">
     <input type="text" id="userInput" placeholder="Type your message..." />
-    <input type="text" id="patientIds" placeholder="Patient IDs (comma separated)" />
     <button id="sendBtn">Send</button>
   </div>
 
 <script>
-let sessionId = null;  // store session across messages in the tab
+let sessionId = null;  
+let darkMode = false;
+let botTyping = false;  // ✅ lock for preventing multiple sends
 
 async function sendMessage() {
+    if (botTyping) return; // ✅ prevent new messages until finished
+
     let input = document.getElementById('userInput');
-    let idsInput = document.getElementById('patientIds');
+    let sendBtn = document.getElementById('sendBtn');
     let text = input.value.trim();
-    let patientIds = idsInput.value.trim();
 
     if (!text) return;
 
     addMessage('user', text);
     input.value = '';
+    botTyping = true;
+    sendBtn.disabled = true;
 
     const loadingDiv = addMessage('bot', 'Typing', true);
 
@@ -102,22 +249,21 @@ async function sendMessage() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
                 query: text,
-                patient_ids: patientIds ? patientIds.split(',').map(id => id.trim()) : [],
-                session_id: sessionId   // ✅ include session_id if available
+                session_id: sessionId
             })
         });
         const data = await resp.json();
         loadingDiv.remove();
 
-        // ✅ Capture and store session_id returned by backend
-        if (data.session_id) {
-            sessionId = data.session_id;
-        }
+        if (data.session_id) sessionId = data.session_id;
 
-        typeOutMessage('bot', data.answer);
+        await typeOutMessage('bot', data.answer);
     } catch (e) {
         loadingDiv.remove();
         addMessage('bot', '⚠️ Error getting response');
+    } finally {
+        botTyping = false;
+        sendBtn.disabled = false;
     }
 }
 
@@ -132,28 +278,38 @@ function addMessage(role, text, isLoading=false) {
 }
 
 function typeOutMessage(role, text) {
-    const chatbox = document.getElementById('chatbox');
-    const div = document.createElement('div');
-    div.className = 'message ' + role;
-    chatbox.appendChild(div);
+    return new Promise(resolve => {
+        const chatbox = document.getElementById('chatbox');
+        const div = document.createElement('div');
+        div.className = 'message ' + role;
+        chatbox.appendChild(div);
 
-    let words = text.split(' ');
-    let i = 0;
+        let words = text.split(' ');
+        let i = 0;
 
-    function showNext() {
-        if (i < words.length) {
-            div.textContent += (i === 0 ? '' : ' ') + words[i];
-            i++;
-            chatbox.scrollTop = chatbox.scrollHeight;
-            setTimeout(showNext, 80);
+        function showNext() {
+            if (i < words.length) {
+                div.textContent += (i === 0 ? '' : ' ') + words[i];
+                i++;
+                chatbox.scrollTop = chatbox.scrollHeight;
+                setTimeout(showNext, 50);
+            } else {
+                resolve();
+            }
         }
-    }
-    showNext();
+        showNext();
+    });
 }
 
 document.getElementById('sendBtn').addEventListener('click', sendMessage);
 document.getElementById('userInput').addEventListener('keypress', function(e){
     if (e.key === 'Enter') sendMessage();
+});
+
+document.getElementById('themeToggle').addEventListener('click', function() {
+    darkMode = !darkMode;
+    document.body.className = darkMode ? 'dark' : 'light';
+    this.textContent = darkMode ? '☀️ Light Mode' : '🌙 Dark Mode';
 });
 </script>
 </body>
