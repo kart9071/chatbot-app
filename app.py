@@ -19,13 +19,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Env ---
-# KB_ID_2 = "WDBONTXTWY"
-KB_ID_1 = "I5E7NJH4NE"   # disabled
-MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
+KB_ID_1 = "I5E7NJH4NE"   
+KB_ID_2 = "ID51DYIDMY"
+MODEL_ID = "arn:aws:bedrock:us-east-1:626635427336:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
 AWS_REGION = "us-east-1"
 DYNAMO_TABLE = "RAGCacheTable"
+S3_BUCKET = "aadi-vidura-cache"
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 
-MAX_CONTEXT_TOKENS = 1000
+
+MAX_CONTEXT_TOKENS = 3000
 
 # --- AWS Clients ---
 agent_client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
@@ -35,6 +38,27 @@ session_table = dynamodb.Table(DYNAMO_TABLE)
 
 # --- Flask ---
 app = Flask(__name__)
+
+def upload_qa_to_s3(session_id: str, question: str, answer: str):
+    """
+    Save each question-answer as a separate TXT file in S3.
+    Filename format: <session_id>_<uuid>.txt
+    """
+    file_id = str(uuid.uuid4())
+    s3_key = f"queries/{session_id}_{file_id}.txt"
+    content = f"Question:\n{question}\n\nAnswer:\n{answer}"
+
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=content,
+            ContentType="text/plain"
+        )
+        logger.info(f"Saved Q&A as TXT in S3: {s3_key}")
+    except Exception as e:
+        logger.error(f"Failed to upload Q&A to S3: {e}")
+
 
 # ----------------- DynamoDB Helpers -----------------
 def get_session_context(session_id: str):
@@ -154,6 +178,7 @@ Task:
      from the conversation history.
    - If the question is complete on its own (standalone), IGNORE the conversation history 
      and just return the user’s question unchanged.
+   - If there are any spelling mistake than change it and give it, don't change if it is related to any date or name like entities.
 
 2. Return ONLY the rewritten question. Do not explain your reasoning. Do not add extra text."""
 
@@ -165,7 +190,7 @@ Task:
                 "messages": [
                     {"role": "user", "content": [{"type": "text", "text": prompt}]}
                 ],
-                "max_tokens": 300,
+                "max_tokens": 3000,
                 "temperature": 0.2
             })
         )
@@ -180,16 +205,19 @@ Task:
 
     return rewritten
 
-
-async def call_claude_with_precise_answers(query: str, context_text: str):
+async def call_claude_with_precise_answers(query: str, content_text: str,cache_context_text:str):
     loop = asyncio.get_event_loop()
     prompt = f"""
 You are an expert medical assistant. Don't answer questions other than healthcare.
 
 You will be given patient documents (each includes name, ID, source, and content).
+if the question is normal and relative to the healthcare and dont need any data to answer that question answer it directly.if you found the answer both in content and previous context combine them and give the answer.
 
-Context:
-{context_text}
+Content:
+{content_text}
+
+Previous Context:
+{cache_context_text}
 
 Question:
 {query}
@@ -215,8 +243,10 @@ Used_Sources:
             body=json.dumps({
                 "anthropic_version": "bedrock-2023-05-31",
                 "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-                "max_tokens": 50000,
-                "temperature": 0.2
+                "max_tokens": 60000,
+                "temperature": 0.1,
+                "top_p":0.3,
+                "top_k":50
             })
         )
         out = json.loads(response['body'].read().decode())
@@ -249,7 +279,6 @@ Used_Sources:
     return answer_text, used_sources
 
 
-
 @app.route("/chat", methods=["POST"])
 async def chat():
     body = request.json
@@ -270,14 +299,15 @@ async def chat():
     # Step 2 - KB retrieval (only KB1)
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor() as executor:
-        r1_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_1, rewritten_query)
+        kb1_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_1, rewritten_query)
+        kb2_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_2, rewritten_query)
+        docs1, docs2 = await asyncio.gather(kb1_future, kb2_future)
         # r2_future = loop.run_in_executor(executor, retrieve_from_kb, KB_ID_2, rewritten_query)
         # docs1, docs2 = await asyncio.gather(r1_future, r2_future)
-        docs1 = await r1_future
-        docs2 = []   # disabled
+    docs2 = docs2[:5] if docs2 else []
 
     # Step 3 - Build context text
-    context_chunks = []
+    content_chunks = []
     for doc in docs1 + docs2:
         c = doc['content'].get('text', '')
         m = extract_chunk_metadata(doc)
@@ -289,17 +319,19 @@ Source: {m['source']}
 Content:
 {c}
 """
-        context_chunks.append(chunk_text)
-    context_text = "\n\n".join(context_chunks)
+        content_chunks.append(chunk_text)
+    content_text = "\n\n".join(content_chunks)
 
+    cache_context_text = "\n\n".join([doc["content"].get("text", "") for doc in docs2])
     # Step 4 - Call Claude
-    answer_text, used_sources = await call_claude_with_precise_answers(rewritten_query, context_text)
+    answer_text, used_sources = await call_claude_with_precise_answers(rewritten_query, content_text,cache_context_text)
 
     logger.info(used_sources)
 
     # Step 5 - Save in session
     append_to_session(session_id, f"Answer: {answer_text}")
 
+    upload_qa_to_s3(session_id,rewritten_query,answer_text)
     # Step 6 - Return response
     return jsonify({
         "answer": answer_text,
